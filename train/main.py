@@ -1,14 +1,16 @@
 import os
 import sys
+from itertools import count
 from dataclasses import dataclass, field
 from typing import Optional
 
+from tqdm import tqdm
 import numpy as np
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from transformers import HfArgumentParser, AutoTokenizer
+from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig
 
 
 @dataclass
@@ -29,6 +31,8 @@ class TrainArgs:
     lr: float = 1e-4
     weight_decay: float = 1e-1
     device: str = 'cpu'
+
+    eval_generate_steps: int = 100
 
 
 @dataclass
@@ -72,20 +76,29 @@ class PositionalEncoding(nn.Module):
         return self.pe[:x.size(1), :]
 
 
-class LLM(nn.Module):
-    def __init__(self, model_args):
-        super().__init__()
-        self.token_embedding = nn.Embedding(model_args.vocab_size, model_args.d_model)
-        self.position_embedding = PositionalEncoding(model_args.d_model, context_length=model_args.max_sequence_length)
-        self.transformer = nn.Transformer(d_model=model_args.d_model, nhead=model_args.n_heads, num_encoder_layers=0,
-                                          num_decoder_layers=model_args.n_layers, dropout=model_args.dropout)
-        self.output = nn.Linear(model_args.d_model, model_args.vocab_size)
-        self.token_embedding.weight = self.output.weight
+def generate(model, tokenizer, max_length=256, question='我们的目标是', temperature=1.0, top_k=None):
+    input_ids = tokenizer.encode(question, return_tensors='pt').to(model.device)
+    eos_id = tokenizer.eos_token_id
 
-    def forward(self, x, y):
-        x = self.token_embedding(x) + self.position_embedding(x)
-        out = self.transformer(x)
-        return self.output(out)
+    model.eval()
+    for i in range(max_length):
+        with torch.no_grad():
+            output: torch.Tensor = model(input_ids).logits
+        logits = output[:, -1, :]
+        if top_k is not None:
+            top_logits, _ = torch.topk(logits, top_k)
+            min_logits = top_logits[:, -1].unsqueeze(-1)
+            logits = torch.where(logits < min_logits, torch.tensor(float('-inf')).to(logits.device), logits)
+        if temperature > 0:
+            logits_div = logits / temperature
+            probs = torch.softmax(logits_div, dim=-1)
+            id_next = torch.multinomial(probs, num_samples=1)
+        else:
+            id_next = torch.argmax(logits, dim=-1, keepdim=True)
+        if id_next.item() == eos_id:
+            break
+        input_ids = torch.cat([input_ids, id_next], dim=-1)
+    return tokenizer.decode(input_ids[0])
 
 
 def main():
@@ -103,21 +116,32 @@ def main():
     dataset = PretrainDataset(data_args.data_path, context_length=model_args.max_sequence_length)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-    llm = LLM(model_args).to(device=train_args.device)
+    llama_config = LlamaConfig(
+        vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
+        num_attention_heads=model_args.n_heads, num_key_value_heads=model_args.n_kv_heads,
+        intermediate_size=4 * model_args.d_model,
+        eos_token_id=tokenizer.eos_token_id, attention_dropout=model_args.dropout,
+    )
+
+    llm = LlamaForCausalLM(llama_config).to(device=train_args.device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=train_args.lr, weight_decay=train_args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(dataloader))
 
     def train_epoch():
-        for step, (x, y) in enumerate(dataloader):
+        progress_bar = tqdm(enumerate(dataloader), leave=False)
+        for step, (x, y) in progress_bar:
             optimizer.zero_grad()
             x, y = x.to(train_args.device), y.to(train_args.device)
-            out = llm(x)
+            out = llm(x).logits
             loss = criterion(out.view(-1, model_args.vocab_size), y.view(-1))
             loss.backward()
             optimizer.step()
             scheduler.step()
-            print(f"Step {step}, Loss: {loss.item()}")
+            progress_bar.set_postfix(loss=loss.item())
+
+            if step % train_args.eval_generate_steps == 0:
+                print(generate(llm, tokenizer, top_k=5))
 
     epochs = 1
     for epoch in range(epochs):
