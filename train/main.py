@@ -1,6 +1,6 @@
 import os
 import sys
-from itertools import count
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,6 +33,8 @@ class TrainArgs:
     device: str = 'cpu'
 
     eval_generate_steps: int = 100
+    checkpoint_save_steps: int = 1000
+    ckpt_path: str = None
 
 
 @dataclass
@@ -101,6 +103,11 @@ def generate(model, tokenizer, max_length=256, question='我们的目标是', te
     return tokenizer.decode(input_ids[0])
 
 
+def print_parameters(model):
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {num_params:,}")
+
+
 def main():
     parser = HfArgumentParser((ModelArgs, TrainArgs, DataArgs))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
@@ -124,24 +131,48 @@ def main():
     )
 
     llm = LlamaForCausalLM(llama_config).to(device=train_args.device)
+    print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=train_args.lr, weight_decay=train_args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(dataloader))
 
+    if train_args.ckpt_path is not None:
+        ckpt_path = Path(train_args.ckpt_path)
+        ckpt_file = ckpt_path / 'checkpoint.pt'
+        if ckpt_file.exists():
+            checkpoint = torch.load(ckpt_file)
+            llm.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+
+    all_tokens = 0
+
     def train_epoch():
+        nonlocal all_tokens
+
         progress_bar = tqdm(enumerate(dataloader), leave=False)
         for step, (x, y) in progress_bar:
             optimizer.zero_grad()
             x, y = x.to(train_args.device), y.to(train_args.device)
-            out = llm(x).logits
-            loss = criterion(out.view(-1, model_args.vocab_size), y.view(-1))
+            out = llm(x)
+            logits = out.logits
+            loss = criterion(logits.view(-1, model_args.vocab_size), y.view(-1))
             loss.backward()
             optimizer.step()
             scheduler.step()
-            progress_bar.set_postfix(loss=loss.item())
+            all_tokens += x.size(0) * x.size(1)
+            progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens, lr=optimizer.param_groups[0]['lr'])
 
             if step % train_args.eval_generate_steps == 0:
                 print(generate(llm, tokenizer, top_k=5))
+
+            if step % train_args.checkpoint_save_steps == 0 and train_args.ckpt_path is not None:
+                ckpt_path.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    'model': llm.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, ckpt_file)
 
     epochs = 1
     for epoch in range(epochs):
