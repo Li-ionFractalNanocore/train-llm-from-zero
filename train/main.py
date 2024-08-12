@@ -39,17 +39,25 @@ class TrainArgs:
 
 @dataclass
 class DataArgs:
-    data_path: str = None
+    train_file_path: str = None
+    valid_file_path: str = None
+    test_file_path: str = None
     tokenizer_path: str = None
 
 
 class PretrainDataset(Dataset):
-    def __init__(self, file, context_length=256):
+    def __init__(self, file, context_length=256, mmap=True):
         super().__init__()
-        with open(file, 'rb') as f:
-            data = np.fromfile(f, dtype=np.uint16)
-        data = data[:len(data) // context_length * context_length]
-        self.data = data.reshape(-1, context_length)
+        if mmap:
+            with open(file, 'r') as f:
+                f.seek(0, 2)
+                length = f.tell() // np.dtype(np.uint16).itemsize
+            self.data = np.memmap(file, dtype=np.uint16, mode='r', shape=(length // context_length, context_length))
+        else:
+            with open(file, 'rb') as f:
+                data = np.fromfile(f, dtype=np.uint16)
+            data = data[:len(data) // context_length * context_length]
+            self.data = data.reshape(-1, context_length)
 
     def __len__(self):
         return self.data.shape[0]
@@ -120,8 +128,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
     model_args.vocab_size = tokenizer.vocab_size
 
-    dataset = PretrainDataset(data_args.data_path, context_length=model_args.max_sequence_length)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+    train_dataset = PretrainDataset(data_args.train_file_path, context_length=model_args.max_sequence_length)
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, drop_last=True)
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -134,7 +142,7 @@ def main():
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=train_args.lr, weight_decay=train_args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(dataloader))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_dataloader))
 
     if train_args.ckpt_path is not None:
         ckpt_path = Path(train_args.ckpt_path)
@@ -150,7 +158,7 @@ def main():
     def train_epoch():
         nonlocal all_tokens
 
-        progress_bar = tqdm(enumerate(dataloader), leave=False)
+        progress_bar = tqdm(enumerate(train_dataloader), leave=False)
         for step, (x, y) in progress_bar:
             optimizer.zero_grad()
             x, y = x.to(train_args.device), y.to(train_args.device)
