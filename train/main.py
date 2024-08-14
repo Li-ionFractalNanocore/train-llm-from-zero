@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 from typing import Optional
 
 from tqdm import tqdm
@@ -25,12 +25,13 @@ class ModelArgs:
     vocab_size: int = -1
     max_sequence_length: int = 256
 
+    batch_size: int = 8
+    lr: float = 1e-4
+    weight_decay: float = 1e-1
+
 
 @dataclass
 class TrainArgs:
-    batch_size: int = 64
-    lr: float = 1e-4
-    weight_decay: float = 1e-1
     device: str = 'cpu'
 
     eval_steps: int = 1000
@@ -130,9 +131,9 @@ def main():
     model_args.vocab_size = tokenizer.vocab_size
 
     train_dataset = PretrainDataset(data_args.train_file_path, context_length=model_args.max_sequence_length)
-    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, drop_last=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=8, shuffle=False, drop_last=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -144,7 +145,7 @@ def main():
     llm = LlamaForCausalLM(llama_config).to(device=train_args.device)
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(llm.parameters(), lr=train_args.lr, weight_decay=train_args.weight_decay)
+    optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_dataloader))
 
     if data_args.ckpt_path is not None:
@@ -157,7 +158,7 @@ def main():
             scheduler.load_state_dict(checkpoint['scheduler'])
 
     all_tokens = 0
-    wandb_logger = wandb.init(project='llm-pretrain', config=dict(model_args))
+    wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args))
 
     def train_epoch():
         nonlocal all_tokens
