@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from tqdm import tqdm
-import numpy as np
+import wandb
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -32,9 +33,8 @@ class TrainArgs:
     weight_decay: float = 1e-1
     device: str = 'cpu'
 
-    eval_generate_steps: int = 100
+    eval_steps: int = 1000
     checkpoint_save_steps: int = 1000
-    ckpt_path: str = None
 
 
 @dataclass
@@ -43,6 +43,7 @@ class DataArgs:
     valid_file_path: str = None
     test_file_path: str = None
     tokenizer_path: str = None
+    ckpt_path: str = None
 
 
 class PretrainDataset(Dataset):
@@ -130,6 +131,8 @@ def main():
 
     train_dataset = PretrainDataset(data_args.train_file_path, context_length=model_args.max_sequence_length)
     train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, drop_last=True)
+    valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=8, shuffle=False, drop_last=True)
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -144,8 +147,8 @@ def main():
     optimizer = torch.optim.AdamW(llm.parameters(), lr=train_args.lr, weight_decay=train_args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_dataloader))
 
-    if train_args.ckpt_path is not None:
-        ckpt_path = Path(train_args.ckpt_path)
+    if data_args.ckpt_path is not None:
+        ckpt_path = Path(data_args.ckpt_path)
         ckpt_file = ckpt_path / 'checkpoint.pt'
         if ckpt_file.exists():
             checkpoint = torch.load(ckpt_file)
@@ -154,11 +157,13 @@ def main():
             scheduler.load_state_dict(checkpoint['scheduler'])
 
     all_tokens = 0
+    wandb_logger = wandb.init(project='llm-pretrain', config=dict(model_args))
 
     def train_epoch():
         nonlocal all_tokens
 
-        progress_bar = tqdm(enumerate(train_dataloader), leave=False)
+        train_losses = []
+        progress_bar = tqdm(enumerate(train_dataloader), leave=True)
         for step, (x, y) in progress_bar:
             optimizer.zero_grad()
             x, y = x.to(train_args.device), y.to(train_args.device)
@@ -170,17 +175,41 @@ def main():
             scheduler.step()
             all_tokens += x.size(0) * x.size(1)
             progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens, lr=optimizer.param_groups[0]['lr'])
+            train_losses.append(loss.item())
 
-            if step % train_args.eval_generate_steps == 0:
-                print(generate(llm, tokenizer, top_k=5))
+            if step % train_args.eval_steps == 0:
+                gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
+                val_loss = eval_epoch(llm)
+                wandb_logger.log({
+                    'train_loss': np.mean(train_losses),
+                    'val_loss': val_loss,
+                    'lr': optimizer.param_groups[0]['lr'],
+                }, step=step)
+                print(gen_text)
+                train_losses.clear()
 
-            if step % train_args.checkpoint_save_steps == 0 and train_args.ckpt_path is not None:
+            if step % train_args.checkpoint_save_steps == 0 and data_args.ckpt_path is not None:
                 ckpt_path.mkdir(parents=True, exist_ok=True)
                 torch.save({
                     'model': llm.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                 }, ckpt_file)
+
+    def eval_epoch(model, eval_data_steps=100):
+        model.eval()
+        valid_losses = []
+        progress_bar = tqdm(enumerate(valid_dataloader), leave=False, total=eval_data_steps)
+        for steps, (x, y) in progress_bar:
+            x, y = x.to(train_args.device), y.to(train_args.device)
+            with torch.no_grad():
+                out = model(x)
+                logits = out.logits
+                loss = criterion(logits.view(-1, model_args.vocab_size), y.view(-1))
+                valid_losses.append(loss.item())
+                if steps >= eval_data_steps:
+                    break
+        return np.mean(valid_losses)
 
     epochs = 1
     for epoch in range(epochs):
