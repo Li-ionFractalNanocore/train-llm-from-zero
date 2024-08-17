@@ -36,6 +36,7 @@ class ModelArgs:
 class TrainArgs:
     device: str = 'cpu'
 
+    max_steps: int = 0
     eval_steps: int = 1000
     checkpoint_save_steps: int = 1000
 
@@ -182,6 +183,9 @@ def main():
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                 }, ckpt_file)
+
+            if train_args.max_steps > 0 and step >= train_args.max_steps:
+                break
 
     def eval_epoch(model, eval_data_steps=100):
         model.eval()
