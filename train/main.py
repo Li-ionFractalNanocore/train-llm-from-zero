@@ -1,7 +1,7 @@
 import os
 import sys
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 from tqdm import tqdm
@@ -10,8 +10,10 @@ import wandb
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig
+
+from train.data.pretrain_dataset import PretrainDataset, MultiPretrainDataset
 
 
 @dataclass
@@ -40,35 +42,12 @@ class TrainArgs:
 
 @dataclass
 class DataArgs:
-    train_file_path: str = None
+    train_file_path: str = field(metadata={'action': 'append', 'type': str})
+    probs: str = None
     valid_file_path: str = None
     test_file_path: str = None
     tokenizer_path: str = None
     ckpt_path: str = None
-
-
-class PretrainDataset(Dataset):
-    def __init__(self, file, context_length=256, mmap=True):
-        super().__init__()
-        if mmap:
-            with open(file, 'r') as f:
-                f.seek(0, 2)
-                length = f.tell() // np.dtype(np.uint16).itemsize
-            self.data = np.memmap(file, dtype=np.uint16, mode='r', shape=(length // context_length, context_length))
-        else:
-            with open(file, 'rb') as f:
-                data = np.fromfile(f, dtype=np.uint16)
-            data = data[:len(data) // context_length * context_length]
-            self.data = data.reshape(-1, context_length)
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        line = self.data[idx]
-        x = np.array(line[:-1], dtype=np.int64)
-        y = np.array(line[1:], dtype=np.int64)
-        return torch.from_numpy(x), torch.from_numpy(y)
 
 
 class PositionalEncoding(nn.Module):
@@ -130,7 +109,13 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
     model_args.vocab_size = tokenizer.vocab_size
 
-    train_dataset = PretrainDataset(data_args.train_file_path, context_length=model_args.max_sequence_length)
+    probs = list(map(float, data_args.probs.split(',')))
+    datasets = []
+    for path in data_args.train_file_path:
+        train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length)
+        datasets.append(train_dataset)
+    train_dataset = MultiPretrainDataset(datasets, probs)
+    print(f'Total tokens: {len(train_dataset) * model_args.max_sequence_length}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length)
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
@@ -180,10 +165,11 @@ def main():
 
             if step % train_args.eval_steps == 0:
                 gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
-                val_loss = eval_epoch(llm)
+                val_loss, perplexity = eval_epoch(llm)
                 wandb_logger.log({
                     'train_loss': np.mean(train_losses),
                     'val_loss': val_loss,
+                    'perplexity': perplexity,
                     'lr': optimizer.param_groups[0]['lr'],
                 }, step=step)
                 print(gen_text)
@@ -200,6 +186,7 @@ def main():
     def eval_epoch(model, eval_data_steps=100):
         model.eval()
         valid_losses = []
+        perplexities = []
         progress_bar = tqdm(enumerate(valid_dataloader), leave=False, total=eval_data_steps)
         for steps, (x, y) in progress_bar:
             x, y = x.to(train_args.device), y.to(train_args.device)
@@ -207,10 +194,12 @@ def main():
                 out = model(x)
                 logits = out.logits
                 loss = criterion(logits.view(-1, model_args.vocab_size), y.view(-1))
+                perplexity = torch.exp(loss)
                 valid_losses.append(loss.item())
+                perplexities.append(perplexity.item())
                 if steps >= eval_data_steps:
                     break
-        return np.mean(valid_losses)
+        return np.mean(valid_losses), np.mean(perplexities)
 
     epochs = 1
     for epoch in range(epochs):
