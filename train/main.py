@@ -125,7 +125,7 @@ def main():
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
 
     max_steps = train_args.max_steps if train_args.max_steps > 0 else len(train_dataloader)
-    warmup_steps = max_steps // 10
+    warmup_steps = max_steps // 100
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
