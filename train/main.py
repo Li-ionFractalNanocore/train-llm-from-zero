@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
+from contextlib import nullcontext
 
 from tqdm import tqdm
 import wandb
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig, get_cosine_schedule_with_warmup
+from accelerate import Accelerator
 
 from train.data.pretrain_dataset import PretrainDataset, MultiPretrainDataset
 
@@ -37,6 +39,7 @@ class ModelArgs:
 @dataclass
 class TrainArgs:
     device: str = 'cpu'
+    accelerator: str = None
 
     max_steps: int = 0
     eval_steps: int = 1000
@@ -112,6 +115,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
     model_args.vocab_size = tokenizer.vocab_size
 
+    if train_args.accelerator == 'accelerate':
+        accelerator = Accelerator(mixed_precision='fp16')
+    else:
+        accelerator = None
+
     probs = list(map(float, data_args.probs.split(',')))
     datasets = []
     for path in data_args.train_file_path:
@@ -134,11 +142,18 @@ def main():
         eos_token_id=tokenizer.eos_token_id, attention_dropout=model_args.dropout,
     )
 
-    llm = LlamaForCausalLM(llama_config).to(device=train_args.device)
+    llm = LlamaForCausalLM(llama_config)
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps, num_cycles=model_args.num_cycles)
+
+    if accelerator:
+        llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
+            llm, optimizer, scheduler, train_dataloader,
+        )
+    else:
+        llm = llm.to(train_args.device)
 
     if data_args.ckpt_path is not None:
         ckpt_path = Path(data_args.ckpt_path)
@@ -161,11 +176,18 @@ def main():
         progress_bar = tqdm(enumerate(train_dataloader), leave=True)
         for step, (x, y) in progress_bar:
             optimizer.zero_grad()
-            x, y = x.to(train_args.device), y.to(train_args.device)
-            out = llm(x)
-            logits = out.logits
-            loss = criterion(logits.view(-1, model_args.vocab_size), y.view(-1))
-            loss.backward()
+            if not accelerator:
+                x, y = x.to(train_args.device), y.to(train_args.device)
+                ctx = nullcontext()
+            else:
+                ctx = accelerator.autocast()
+            with ctx:
+                out = llm(x, labels=y)
+                loss = out.loss
+            if accelerator:
+                accelerator.backward(loss)
+            else:
+                loss.backward()
             optimizer.step()
             scheduler.step()
             all_tokens += x.size(0) * x.size(1)
