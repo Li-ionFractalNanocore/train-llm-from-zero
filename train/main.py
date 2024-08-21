@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
@@ -11,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig
+from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig, get_cosine_schedule_with_warmup
 
 from train.data.pretrain_dataset import PretrainDataset, MultiPretrainDataset
 
@@ -30,6 +31,7 @@ class ModelArgs:
     batch_size: int = 8
     lr: float = 1e-4
     weight_decay: float = 1e-1
+    num_cycles: float = 10.0
 
 
 @dataclass
@@ -116,10 +118,14 @@ def main():
         train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length)
         datasets.append(train_dataset)
     train_dataset = MultiPretrainDataset(datasets, probs)
-    print(f'Total tokens: {len(train_dataset) * model_args.max_sequence_length}')
+    print(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
+    print(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length)
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
+
+    max_steps = train_args.max_steps if train_args.max_steps > 0 else len(train_dataloader)
+    warmup_steps = max_steps // 10
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -132,7 +138,7 @@ def main():
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, len(train_dataloader))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps, num_cycles=model_args.num_cycles)
 
     if data_args.ckpt_path is not None:
         ckpt_path = Path(data_args.ckpt_path)
@@ -144,12 +150,14 @@ def main():
             scheduler.load_state_dict(checkpoint['scheduler'])
 
     all_tokens = 0
+    global_steps = 0
     wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args))
 
     def train_epoch():
-        nonlocal all_tokens
+        nonlocal all_tokens, global_steps
 
         train_losses = []
+        begin_time = time.time()
         progress_bar = tqdm(enumerate(train_dataloader), leave=True)
         for step, (x, y) in progress_bar:
             optimizer.zero_grad()
@@ -167,11 +175,15 @@ def main():
             if step % train_args.eval_steps == 0:
                 gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
                 val_loss, perplexity = eval_epoch(llm)
+                now = time.time()
+                tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (now - begin_time)
+                begin_time = now
                 wandb_logger.log({
                     'train_loss': np.mean(train_losses),
                     'val_loss': val_loss,
                     'perplexity': perplexity,
                     'lr': optimizer.param_groups[0]['lr'],
+                    'tokens_per_sec': tokens_per_sec,
                 }, step=step)
                 print(gen_text)
                 train_losses.clear()
@@ -184,15 +196,15 @@ def main():
                     'scheduler': scheduler.state_dict(),
                 }, ckpt_file)
 
-            if train_args.max_steps > 0 and step >= train_args.max_steps:
+            global_steps += 1
+            if global_steps >= max_steps:
                 break
 
     def eval_epoch(model, eval_data_steps=100):
         model.eval()
         valid_losses = []
         perplexities = []
-        progress_bar = tqdm(enumerate(valid_dataloader), leave=False, total=eval_data_steps)
-        for steps, (x, y) in progress_bar:
+        for steps, (x, y) in enumerate(valid_dataloader):
             x, y = x.to(train_args.device), y.to(train_args.device)
             with torch.no_grad():
                 out = model(x)
@@ -208,6 +220,8 @@ def main():
     epochs = 1
     for epoch in range(epochs):
         train_epoch()
+        if global_steps >= train_args.max_steps:
+            break
 
 
 if __name__ == '__main__':
