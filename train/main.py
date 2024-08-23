@@ -41,6 +41,7 @@ class ModelArgs:
 class TrainArgs:
     device: str = 'cpu'
     mixed_precision: str = None
+    compile: bool = False
 
     max_steps: int = 0
     eval_steps: int = 1000
@@ -148,6 +149,10 @@ def main():
     optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, scheduler_steps,
                                                 num_cycles=model_args.num_cycles)
+
+    if train_args.compile:
+        orig_llm = llm
+        llm = torch.compile(llm)
 
     llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
         llm, optimizer, scheduler, train_dataloader,
