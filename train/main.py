@@ -4,7 +4,6 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
-from contextlib import nullcontext
 
 from tqdm import tqdm
 import wandb
@@ -30,16 +29,18 @@ class ModelArgs:
     vocab_size: int = -1
     max_sequence_length: int = 256
 
-    batch_size: int = 8
-    lr: float = 1e-4
+    lr: float = 5e-4
     weight_decay: float = 1e-1
     num_cycles: float = 10.0
+
+    batch_size: int = 16
+    grad_accum: int = None
 
 
 @dataclass
 class TrainArgs:
     device: str = 'cpu'
-    accelerator: str = None
+    mixed_precision: str = None
 
     max_steps: int = 0
     eval_steps: int = 1000
@@ -115,10 +116,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
     model_args.vocab_size = tokenizer.vocab_size
 
-    if train_args.accelerator == 'accelerate':
-        accelerator = Accelerator(mixed_precision='fp16')
-    else:
-        accelerator = None
+    accelerator = Accelerator(mixed_precision=train_args.mixed_precision,
+                              gradient_accumulation_steps=model_args.grad_accum)
 
     probs = list(map(float, data_args.probs.split(',')))
     datasets = []
@@ -133,7 +132,8 @@ def main():
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
 
     max_steps = train_args.max_steps if train_args.max_steps > 0 else len(train_dataloader)
-    warmup_steps = max_steps // 100
+    scheduler_steps = max_steps if model_args.grad_accum is None else max_steps // model_args.grad_accum
+    warmup_steps = scheduler_steps // 100
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -146,14 +146,12 @@ def main():
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max_steps, num_cycles=model_args.num_cycles)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, scheduler_steps,
+                                                num_cycles=model_args.num_cycles)
 
-    if accelerator:
-        llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
-            llm, optimizer, scheduler, train_dataloader,
-        )
-    else:
-        llm = llm.to(train_args.device)
+    llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
+        llm, optimizer, scheduler, train_dataloader,
+    )
 
     if data_args.ckpt_path is not None:
         ckpt_path = Path(data_args.ckpt_path)
@@ -166,7 +164,7 @@ def main():
 
     all_tokens = 0
     global_steps = 0
-    wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args))
+    wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args).update(asdict(train_args)))
 
     def train_epoch():
         nonlocal all_tokens, global_steps
@@ -175,21 +173,17 @@ def main():
         begin_time = time.time()
         progress_bar = tqdm(enumerate(train_dataloader), leave=True)
         for step, (x, y) in progress_bar:
-            optimizer.zero_grad()
-            if not accelerator:
-                x, y = x.to(train_args.device), y.to(train_args.device)
-                ctx = nullcontext()
-            else:
-                ctx = accelerator.autocast()
-            with ctx:
-                out = llm(x, labels=y)
-                loss = out.loss
-            if accelerator:
-                accelerator.backward(loss)
-            else:
-                loss.backward()
-            optimizer.step()
-            scheduler.step()
+            with accelerator.accumulate(llm):
+                optimizer.zero_grad()
+                with accelerator.autocast():
+                    out = llm(x, labels=y)
+                    loss = out.loss
+                if accelerator:
+                    accelerator.backward(loss)
+                else:
+                    loss.backward()
+                optimizer.step()
+                scheduler.step()
             all_tokens += x.size(0) * x.size(1)
             progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens, lr=optimizer.param_groups[0]['lr'])
             train_losses.append(loss.item())
@@ -198,7 +192,8 @@ def main():
                 gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
                 val_loss, perplexity = eval_epoch(llm)
                 now = time.time()
-                tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (now - begin_time)
+                tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (
+                        now - begin_time)
                 begin_time = now
                 wandb_logger.log({
                     'train_loss': np.mean(train_losses),
