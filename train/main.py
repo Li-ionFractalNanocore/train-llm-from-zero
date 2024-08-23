@@ -42,6 +42,7 @@ class TrainArgs:
     device: str = 'cpu'
     mixed_precision: str = None
     compile: bool = False
+    fused: bool = False
 
     max_steps: int = 0
     eval_steps: int = 1000
@@ -146,7 +147,11 @@ def main():
     llm = LlamaForCausalLM(llama_config)
     print_parameters(llm)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
+    if train_args.fused:
+        from apex.optimizers import FusedAdam
+        optimizer = FusedAdam(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, scheduler_steps,
                                                 num_cycles=model_args.num_cycles)
 
