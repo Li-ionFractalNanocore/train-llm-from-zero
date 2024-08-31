@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 
 
 class PretrainDataset(Dataset):
-    def __init__(self, path, context_length=256, mmap=True):
+    def __init__(self, path, context_length=256, mmap=True, shift=True):
         super().__init__()
         files = glob.glob(path)
         self.data = []
@@ -28,6 +28,7 @@ class PretrainDataset(Dataset):
                 self.data.append(data)
         self.whole_length = sum(self.indices)
         self.indices = np.cumsum(self.indices)
+        self.shift = shift
 
     def __len__(self):
         return self.whole_length
@@ -36,8 +37,12 @@ class PretrainDataset(Dataset):
         idx = idx % self.whole_length
         dataset_idx = np.searchsorted(self.indices, idx)
         line = self.data[dataset_idx][idx - self.indices[dataset_idx]]
-        x = np.array(line[:-1], dtype=np.int64)
-        y = np.array(line[1:], dtype=np.int64)
+        if self.shift:
+            x = np.array(line[:-1], dtype=np.int64)
+            y = np.array(line[1:], dtype=np.int64)
+        else:
+            x = np.array(line, dtype=np.int64)
+            y = np.array(line, dtype=np.int64)
         return torch.from_numpy(x), torch.from_numpy(y)
 
 

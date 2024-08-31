@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
@@ -47,6 +48,7 @@ class TrainArgs:
     max_steps: int = 0
     eval_steps: int = 1000
     checkpoint_save_steps: int = 1000
+    resume: bool = False
 
 
 @dataclass
@@ -56,7 +58,7 @@ class DataArgs:
     valid_file_path: str = None
     test_file_path: str = None
     tokenizer_path: str = None
-    ckpt_path: str = None
+    project_dir: str = None
 
 
 class PositionalEncoding(nn.Module):
@@ -106,6 +108,28 @@ def print_parameters(model):
     print(f"Total parameters: {num_params:,}")
 
 
+def get_subfolders_sorted_by_time(folder: Path):
+    if not folder.exists():
+        return []
+    return sorted([f for f in folder.iterdir() if f.is_dir()], key=lambda f: f.stat().st_ctime)
+
+
+def load_checkpoint(accelerator: Accelerator, path: str):
+    path = Path(path)
+    checkpoints = get_subfolders_sorted_by_time(path)
+    if checkpoints:
+        accelerator.load_state(checkpoints[-1])
+
+
+def save_checkpoint(accelerator: Accelerator, path: str, max_checkpoints: int = 5):
+    path = Path(path)
+    checkpoints = get_subfolders_sorted_by_time(path)
+    if len(checkpoints) >= max_checkpoints:
+        shutil.rmtree(checkpoints[0])
+    save_path = Path(path) / f"checkpoint_{accelerator.step}"
+    accelerator.save_state(save_path)
+
+
 def main():
     parser = HfArgumentParser((ModelArgs, TrainArgs, DataArgs))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
@@ -118,19 +142,24 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
     model_args.vocab_size = tokenizer.vocab_size
 
-    accelerator = Accelerator(mixed_precision=train_args.mixed_precision,
-                              gradient_accumulation_steps=model_args.grad_accum)
+    accelerator = Accelerator(
+        mixed_precision=train_args.mixed_precision,
+        gradient_accumulation_steps=model_args.grad_accum,
+        project_dir=data_args.project_dir,
+    )
+
 
     probs = list(map(float, data_args.probs.split(',')))
     datasets = []
     for path in data_args.train_file_path:
-        train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length)
+        train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length, shift=False)
         datasets.append(train_dataset)
     train_dataset = MultiPretrainDataset(datasets, probs)
     print(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
     print(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
-    valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length)
+    valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length,
+                                    shift=False)
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
 
     max_steps = train_args.max_steps if train_args.max_steps > 0 else len(train_dataloader)
@@ -146,7 +175,6 @@ def main():
 
     llm = LlamaForCausalLM(llama_config)
     print_parameters(llm)
-    criterion = nn.CrossEntropyLoss()
     if train_args.fused:
         from apex.optimizers import FusedAdam
         optimizer = FusedAdam(llm.parameters(), lr=model_args.lr, weight_decay=model_args.weight_decay)
@@ -162,27 +190,24 @@ def main():
     llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
         llm, optimizer, scheduler, train_dataloader,
     )
-
-    if data_args.ckpt_path is not None:
-        ckpt_path = Path(data_args.ckpt_path)
-        ckpt_file = ckpt_path / 'checkpoint.pt'
-        if ckpt_file.exists():
-            checkpoint = torch.load(ckpt_file)
-            llm.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-
     all_tokens = 0
-    global_steps = 0
+
+    if train_args.resume and data_args.project_dir is not None and os.path.exists(data_args.project_dir):
+        load_checkpoint(accelerator, data_args.project_dir)
+        print(f'Training at {accelerator.step}')
+
     wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args).update(asdict(train_args)))
 
     def train_epoch():
-        nonlocal all_tokens, global_steps
+        nonlocal all_tokens
 
         train_losses = []
         begin_time = time.time()
         progress_bar = tqdm(enumerate(train_dataloader), leave=True)
         for step, (x, y) in progress_bar:
+            if accelerator.step >= max_steps:
+                break
+
             with accelerator.accumulate(llm):
                 optimizer.zero_grad()
                 with accelerator.autocast():
@@ -198,34 +223,26 @@ def main():
             progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens, lr=optimizer.param_groups[0]['lr'])
             train_losses.append(loss.item())
 
-            if step % train_args.eval_steps == 0:
-                gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
-                val_loss, perplexity = eval_epoch(llm)
-                now = time.time()
-                tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (
-                        now - begin_time)
-                begin_time = now
-                wandb_logger.log({
-                    'train_loss': np.mean(train_losses),
-                    'val_loss': val_loss,
-                    'perplexity': perplexity,
-                    'lr': optimizer.param_groups[0]['lr'],
-                    'tokens_per_sec': tokens_per_sec,
-                }, step=step)
-                print(gen_text)
-                train_losses.clear()
+            if accelerator.is_main_process:
+                if step % train_args.eval_steps == 0:
+                    gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
+                    val_loss, perplexity = eval_epoch(llm)
+                    now = time.time()
+                    tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (
+                            now - begin_time)
+                    begin_time = now
+                    wandb_logger.log({
+                        'train_loss': np.mean(train_losses),
+                        'val_loss': val_loss,
+                        'perplexity': perplexity,
+                        'lr': optimizer.param_groups[0]['lr'],
+                        'tokens_per_sec': tokens_per_sec,
+                    }, step=step)
+                    print(gen_text)
+                    train_losses.clear()
 
-            if step % train_args.checkpoint_save_steps == 0 and data_args.ckpt_path is not None:
-                ckpt_path.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    'model': llm.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                }, ckpt_file)
-
-            global_steps += 1
-            if global_steps >= max_steps:
-                break
+                if (step + 1) % train_args.checkpoint_save_steps == 0 and data_args.project_dir is not None:
+                    save_checkpoint(accelerator, data_args.project_dir)
 
     def eval_epoch(model, eval_data_steps=100):
         model.eval()
@@ -234,9 +251,8 @@ def main():
         for steps, (x, y) in enumerate(valid_dataloader):
             x, y = x.to(train_args.device), y.to(train_args.device)
             with torch.no_grad():
-                out = model(x)
-                logits = out.logits
-                loss = criterion(logits.view(-1, model_args.vocab_size), y.view(-1))
+                out = model(x, labels=y)
+                loss = out.loss
                 perplexity = torch.exp(loss)
                 valid_losses.append(loss.item())
                 perplexities.append(perplexity.item())
@@ -247,8 +263,6 @@ def main():
     epochs = 1
     for epoch in range(epochs):
         train_epoch()
-        if global_steps >= train_args.max_steps:
-            break
 
 
 if __name__ == '__main__':
