@@ -2,3 +2,4 @@ wandb
 tqdm
 transformers
 pytorch
+accelerate
