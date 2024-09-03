@@ -167,7 +167,7 @@ def main():
         datasets.append(train_dataset)
     train_dataset = MultiPretrainDataset(datasets, probs)
     logger.info(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
-    logger.info(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length}')
+    logger.info(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length * accelerator.num_processes}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length,
                                     shift=False)
