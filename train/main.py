@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import shutil
+import logging
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
@@ -15,6 +16,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig, get_cosine_schedule_with_warmup
 from accelerate import Accelerator
+from accelerate.logging import get_logger
 
 from train.data.pretrain_dataset import PretrainDataset, MultiPretrainDataset
 
@@ -62,6 +64,9 @@ class DataArgs:
     project_dir: str = None
 
 
+logger = get_logger('llm')
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, context_length):
         super().__init__()
@@ -106,7 +111,7 @@ def generate(model, tokenizer, max_length=256, question='我们的目标是', te
 
 def print_parameters(model):
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {num_params:,}")
+    logger.info(f"Total parameters: {num_params:,}", main_process_only=True)
 
 
 def get_subfolders_sorted_by_time(folder: Path):
@@ -132,6 +137,11 @@ def save_checkpoint(accelerator: Accelerator, path: str, max_checkpoints: int = 
 
 
 def main():
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(lineno)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
     parser = HfArgumentParser((ModelArgs, TrainArgs, DataArgs))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
         model_args, train_args, data_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
@@ -156,8 +166,8 @@ def main():
         train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length, shift=False)
         datasets.append(train_dataset)
     train_dataset = MultiPretrainDataset(datasets, probs)
-    print(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
-    print(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length}')
+    logger.info(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
+    logger.info(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length,
                                     shift=False)
@@ -195,7 +205,7 @@ def main():
 
     if train_args.resume and data_args.project_dir is not None and os.path.exists(data_args.project_dir):
         load_checkpoint(accelerator, data_args.project_dir)
-        print(f'Training at {accelerator.step}')
+        logger.info(f'Training at {accelerator.step}')
 
     if accelerator.is_main_process:
         wandb_logger = wandb.init(project=data_args.project_name, config=asdict(model_args).update(asdict(train_args)))
@@ -205,7 +215,7 @@ def main():
 
         train_losses = []
         begin_time = time.time()
-        progress_bar = tqdm(enumerate(train_dataloader), leave=True)
+        progress_bar = tqdm(enumerate(train_dataloader), leave=True, disable=not accelerator.is_main_process)
         for step, (x, y) in progress_bar:
             if accelerator.step >= max_steps:
                 break
@@ -240,7 +250,7 @@ def main():
                         'lr': optimizer.param_groups[0]['lr'],
                         'tokens_per_sec': tokens_per_sec,
                     }, step=step)
-                    print(gen_text)
+                    logger.info(gen_text)
                     train_losses.clear()
 
                 if (step + 1) % train_args.checkpoint_save_steps == 0 and data_args.project_dir is not None:
