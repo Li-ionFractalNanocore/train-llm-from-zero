@@ -54,6 +54,7 @@ class TrainArgs:
 @dataclass
 class DataArgs:
     train_file_path: str = field(metadata={'action': 'append', 'type': str})
+    project_name: str = 'llm-pretrain'
     probs: str = None
     valid_file_path: str = None
     test_file_path: str = None
@@ -196,7 +197,7 @@ def main():
         load_checkpoint(accelerator, data_args.project_dir)
         print(f'Training at {accelerator.step}')
 
-    wandb_logger = wandb.init(project='llm-pretrain', config=asdict(model_args).update(asdict(train_args)))
+    wandb_logger = wandb.init(project=data_args.project_name, config=asdict(model_args).update(asdict(train_args)))
 
     def train_epoch():
         nonlocal all_tokens
