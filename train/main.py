@@ -197,7 +197,8 @@ def main():
         load_checkpoint(accelerator, data_args.project_dir)
         print(f'Training at {accelerator.step}')
 
-    wandb_logger = wandb.init(project=data_args.project_name, config=asdict(model_args).update(asdict(train_args)))
+    if accelerator.is_main_process:
+        wandb_logger = wandb.init(project=data_args.project_name, config=asdict(model_args).update(asdict(train_args)))
 
     def train_epoch():
         nonlocal all_tokens
