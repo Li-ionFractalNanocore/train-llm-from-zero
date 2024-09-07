@@ -273,7 +273,8 @@ def main():
             llm.train()
             with accelerator.accumulate(llm):
                 optimizer.zero_grad()
-                out = llm(x, labels=y)
+                with accelerator.autocast():
+                    out = llm(x, labels=y)
                 loss = out.loss
                 if accelerator:
                     accelerator.backward(loss)
