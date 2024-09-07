@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -15,8 +16,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, AutoTokenizer, LlamaForCausalLM, LlamaConfig, get_cosine_schedule_with_warmup
+import transformers.utils
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from accelerate.utils import set_seed
 
 from train.data.pretrain_dataset import PretrainDataset, MultiPretrainDataset
 
@@ -57,6 +60,7 @@ class TrainArgs:
 class DataArgs:
     train_file_path: str = field(metadata={'action': 'append', 'type': str})
     project_name: str = 'llm-pretrain'
+    seed: int = None
     probs: str = None
     valid_file_path: str = None
     test_file_path: str = None
@@ -150,15 +154,21 @@ def main():
     else:
         model_args, train_args, data_args = parser.parse_args_into_dataclasses()
 
-    tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
-    model_args.vocab_size = tokenizer.vocab_size
-
     accelerator = Accelerator(
         mixed_precision=train_args.mixed_precision,
         gradient_accumulation_steps=model_args.grad_accum,
         project_dir=data_args.project_dir,
     )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+    if data_args.seed is not None:
+        set_seed(data_args.seed)
 
+    tokenizer = AutoTokenizer.from_pretrained(data_args.tokenizer_path, trust_remote_code=True)
+    model_args.vocab_size = tokenizer.vocab_size
 
     probs = list(map(float, data_args.probs.split(',')))
     datasets = []
@@ -166,16 +176,25 @@ def main():
         train_dataset = PretrainDataset(path, context_length=model_args.max_sequence_length, shift=False)
         datasets.append(train_dataset)
     train_dataset = MultiPretrainDataset(datasets, probs)
-    logger.info(f'Dataset total tokens: {len(train_dataset) * model_args.max_sequence_length}')
-    logger.info(f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length * accelerator.num_processes}')
+    total_batch_size = model_args.batch_size * accelerator.num_processes
+    total_batch_tokens = total_batch_size * model_args.max_sequence_length
+    logger.info(f'Dataset examples: {len(train_dataset)}')
+    logger.info(f'Dataset tokens: {len(train_dataset) * model_args.max_sequence_length}')
+    logger.info(
+        f'Training total tokens: {train_args.max_steps * model_args.batch_size * model_args.max_sequence_length * accelerator.num_processes}')
+    logger.info(f'Effective batch size: {total_batch_size}')
+    logger.info(f'Effective tokens per batch: {total_batch_tokens}')
+    logger.info(
+        f'Real tokens per batch: {total_batch_tokens * accelerator.gradient_accumulation_steps * accelerator.num_processes}')
     train_dataloader = DataLoader(train_dataset, batch_size=model_args.batch_size, shuffle=True, drop_last=True)
     valid_dataset = PretrainDataset(data_args.valid_file_path, context_length=model_args.max_sequence_length,
                                     shift=False)
     valid_dataloader = DataLoader(valid_dataset, batch_size=model_args.batch_size, shuffle=False, drop_last=True)
+    logger.info(f'Dataset total steps: {len(train_dataloader)}')
 
     max_steps = train_args.max_steps if train_args.max_steps > 0 else len(train_dataloader)
     scheduler_steps = max_steps if model_args.grad_accum is None else max_steps // model_args.grad_accum
-    warmup_steps = scheduler_steps // 100
+    warmup_steps = 8000 * accelerator.gradient_accumulation_steps
 
     llama_config = LlamaConfig(
         vocab_size=model_args.vocab_size, hidden_size=model_args.d_model, num_hidden_layers=model_args.n_layers,
@@ -201,60 +220,25 @@ def main():
     llm, optimizer, scheduler, train_dataloader = accelerator.prepare(
         llm, optimizer, scheduler, train_dataloader,
     )
-    all_tokens = 0
+    total_steps_per_device = len(train_dataloader)
+    logger.info(f'Total steps per device per epoch: {total_steps_per_device}')
+    epochs = math.ceil(max_steps / total_steps_per_device)
+    logger.info(f'Total epochs: {epochs}')
 
     if train_args.resume and data_args.project_dir is not None and os.path.exists(data_args.project_dir):
         load_checkpoint(accelerator, data_args.project_dir)
         logger.info(f'Training at {accelerator.step}')
+        starting_epoch = accelerator.step // total_steps_per_device
+        resume_steps = accelerator.step % total_steps_per_device
+    else:
+        starting_epoch = 0
+        resume_steps = 0
 
     if accelerator.is_main_process:
         wandb_logger = wandb.init(project=data_args.project_name, config=asdict(model_args).update(asdict(train_args)))
 
-    def train_epoch():
-        nonlocal all_tokens
-
-        train_losses = []
-        begin_time = time.time()
-        progress_bar = tqdm(enumerate(train_dataloader), leave=True, disable=not accelerator.is_main_process)
-        for step, (x, y) in progress_bar:
-            if accelerator.step >= max_steps:
-                break
-
-            with accelerator.accumulate(llm):
-                optimizer.zero_grad()
-                with accelerator.autocast():
-                    out = llm(x, labels=y)
-                    loss = out.loss
-                if accelerator:
-                    accelerator.backward(loss)
-                else:
-                    loss.backward()
-                optimizer.step()
-                scheduler.step()
-            all_tokens += x.size(0) * x.size(1)
-            progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens, lr=optimizer.param_groups[0]['lr'])
-            train_losses.append(loss.item())
-
-            if accelerator.is_main_process:
-                if step % train_args.eval_steps == 0:
-                    gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
-                    val_loss, perplexity = eval_epoch(llm)
-                    now = time.time()
-                    tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (
-                            now - begin_time)
-                    begin_time = now
-                    wandb_logger.log({
-                        'train_loss': np.mean(train_losses),
-                        'val_loss': val_loss,
-                        'perplexity': perplexity,
-                        'lr': optimizer.param_groups[0]['lr'],
-                        'tokens_per_sec': tokens_per_sec,
-                    }, step=step)
-                    logger.info(gen_text)
-                    train_losses.clear()
-
-                if (step + 1) % train_args.checkpoint_save_steps == 0 and data_args.project_dir is not None:
-                    save_checkpoint(accelerator, data_args.project_dir)
+    progress_bar = tqdm(range(max_steps), leave=True, disable=not accelerator.is_main_process)
+    progress_bar.update(accelerator.step)
 
     def eval_epoch(model, eval_data_steps=100):
         model.eval()
@@ -272,9 +256,60 @@ def main():
                     break
         return np.mean(valid_losses), np.mean(perplexities)
 
-    epochs = 1
-    for epoch in range(epochs):
-        train_epoch()
+    all_tokens = accelerator.step * model_args.batch_size * model_args.max_sequence_length
+    for epoch in range(starting_epoch, epochs):
+        train_losses = []
+
+        if train_args.resume and epoch == starting_epoch and resume_steps > 0:
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_steps)
+        else:
+            active_dataloader = train_dataloader
+
+        begin_time = time.time()
+        for step, (x, y) in enumerate(active_dataloader):
+            if accelerator.step >= max_steps:
+                break
+
+            llm.train()
+            with accelerator.accumulate(llm):
+                optimizer.zero_grad()
+                out = llm(x, labels=y)
+                loss = out.loss
+                if accelerator:
+                    accelerator.backward(loss)
+                else:
+                    loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+            progress_bar.update(1)
+            if accelerator.sync_gradients:
+                progress_bar.set_postfix(loss=loss.item(), all_tokens=all_tokens,
+                                         lr=optimizer.param_groups[0]['lr'])
+
+            all_tokens += x.size(0) * x.size(1)
+            train_losses.append(loss.item())
+
+            if accelerator.is_main_process:
+                if accelerator.step % train_args.eval_steps == 0:
+                    gen_text = generate(llm, tokenizer, max_length=100, top_k=5)
+                    val_loss, perplexity = eval_epoch(llm)
+                    now = time.time()
+                    tokens_per_sec = model_args.batch_size * model_args.max_sequence_length * train_args.eval_steps / (
+                            now - begin_time)
+                    begin_time = now
+                    wandb_logger.log({
+                        'train_loss': np.mean(train_losses),
+                        'val_loss': val_loss,
+                        'perplexity': perplexity,
+                        'lr': optimizer.param_groups[0]['lr'],
+                        'tokens_per_sec': tokens_per_sec,
+                    }, step=accelerator.step)
+                    logger.info(gen_text)
+                    train_losses.clear()
+
+                if accelerator.step % train_args.checkpoint_save_steps == 0 and data_args.project_dir is not None:
+                    save_checkpoint(accelerator, data_args.project_dir)
 
 
 if __name__ == '__main__':
